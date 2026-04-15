@@ -1,0 +1,14 @@
+{
+  "name": "cc-hello",
+  "version": "1.0.0",
+  "description": "Claude Code /hello command - print current session Q&A history",
+  "bin": {
+    "cc-hello": "./install.js"
+  },
+  "files": [
+    "install.js",
+    "hello.js",
+    "hello.md"
+  ],
+  "license": "MIT"
+}
