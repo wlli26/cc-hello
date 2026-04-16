@@ -40,44 +40,115 @@ const jsonlFile = jsonlFiles
 const filePath = path.join(projectDir, jsonlFile);
 const lines = fs.readFileSync(filePath, 'utf8').trim().split('\n');
 
+// Helper: strip system tags like <local-command-caveat>, <system-reminder>
+function stripSystemTags(text) {
+  // Remove entire tag blocks (opening tag + content + closing tag)
+  text = text.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/gi, '');
+  text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '');
+  text = text.replace(/<command-name>[\s\S]*?<\/command-name>/gi, '');
+  text = text.replace(/<command-message>[\s\S]*?<\/command-message>/gi, '');
+  text = text.replace(/<command-args>[\s\S]*?<\/command-args>/gi, '');
+  text = text.replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/gi, '');
+  // Remove any remaining standalone tags
+  text = text.replace(/<[^>]+>/g, '');
+  return text.trim();
+}
+
+// Tools worth including (carry meaningful context for workflow generation)
+const RELEVANT_TOOLS = new Set([
+  'Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob', 'WebFetch', 'WebSearch',
+  'NotebookEdit', 'Agent', 'AskUserQuestion'
+]);
+
+// Helper: extract key params from tool input
+function summarizeToolInput(toolName, input) {
+  if (toolName === 'Read') return { file: input.file_path };
+  if (toolName === 'Write') return { file: input.file_path };
+  if (toolName === 'Edit') return { file: input.file_path };
+  if (toolName === 'Bash') return { command: (input.command || '').slice(0, 80) };
+  if (toolName === 'Grep') return { pattern: input.pattern, path: input.path };
+  if (toolName === 'Glob') return { pattern: input.pattern };
+  return input;
+}
+
 let count = 0;
-const output = [];
+const messages = [];
 
 lines.forEach(line => {
   try {
     const obj = JSON.parse(line);
     if (obj.type !== 'user' && obj.type !== 'assistant') return;
 
-    count++;
-    const role = obj.type === 'user' ? 'User' : 'Assistant';
+    const role = obj.type === 'user' ? 'user' : 'assistant';
     const msg = obj.message;
-    let content = '';
+    const entry = { role, content: [] };
 
+    if (!msg.content) return;
+
+    // Extract text content
     if (typeof msg.content === 'string') {
-      content = msg.content;
+      const cleaned = stripSystemTags(msg.content);
+      if (cleaned) entry.content.push({ type: 'text', text: cleaned });
     } else if (Array.isArray(msg.content)) {
-      content = msg.content
-        .filter(c => c.type === 'text')
-        .map(c => c.text)
-        .join('\n');
+      msg.content.forEach(c => {
+        if (c.type === 'text') {
+          const cleaned = stripSystemTags(c.text);
+          if (cleaned) entry.content.push({ type: 'text', text: cleaned });
+        } else if (c.type === 'tool_use') {
+          if (!RELEVANT_TOOLS.has(c.name)) return; // skip internal tools
+          const toolSummary = summarizeToolInput(c.name, c.input || {});
+          entry.content.push({ type: 'tool_use', name: c.name, input: toolSummary });
+        } else if (c.type === 'tool_result') {
+          let resultText = '';
+          if (typeof c.content === 'string') {
+            resultText = c.content;
+          } else if (Array.isArray(c.content)) {
+            resultText = c.content.filter(x => x.type === 'text').map(x => x.text).join('\n');
+          }
+          resultText = stripSystemTags(resultText).slice(0, 500);
+          // Skip internal tool results (Task/Config/etc)
+          if (/^(Task|Updated task|Set model|Installed|Done\.|Summary)/i.test(resultText)) return;
+          if (resultText) entry.content.push({ type: 'tool_result', text: resultText });
+        }
+      });
     }
 
-    if (!content.trim()) return;
-
-    output.push(`=== #${count} [${role}] ===`);
-    output.push(content);
-    output.push('');
+    if (entry.content.length > 0) {
+      count++;
+      messages.push(entry);
+    }
   } catch (e) {}
 });
 
-output.push(`--- Total: ${count} messages ---`);
+// Write structured JSON for workflow generation
+const jsonFile = path.join(cwd, 'hello-output.json');
+fs.writeFileSync(jsonFile, JSON.stringify(messages, null, 2), 'utf8');
 
-// Write to a fixed output file (not stdout)
+// Write human-readable text for quick review
+const textLines = [];
+messages.forEach((m, i) => {
+  textLines.push(`=== #${i + 1} [${m.role}] ===`);
+  m.content.forEach(c => {
+    if (c.type === 'text') {
+      textLines.push(c.text);
+    } else if (c.type === 'tool_use') {
+      textLines.push(`[Tool: ${c.name}] ${JSON.stringify(c.input)}`);
+    } else if (c.type === 'tool_result') {
+      textLines.push(`[Result] ${c.text}`);
+    }
+  });
+  textLines.push('');
+});
+textLines.push(`--- Total: ${count} messages ---`);
+
 const outFile = path.join(cwd, 'hello-output.txt');
-fs.writeFileSync(outFile, output.join('\n'), 'utf8');
+fs.writeFileSync(outFile, textLines.join('\n'), 'utf8');
 
 const winPath = outFile.replace(/\//g, '\\');
-console.log(`Done. ${count} messages written to: ${winPath}`);
+const jsonWinPath = jsonFile.replace(/\//g, '\\');
+console.log(`Done. ${count} messages written to:`);
+console.log(`  Text: ${winPath}`);
+console.log(`  JSON: ${jsonWinPath}`);
 
 // --- Summarize via SiliconFlow API ---
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
@@ -87,7 +158,7 @@ if (!SILICONFLOW_API_KEY) {
 }
 
 const MAX_CHARS = 12000;
-const qaText = output.join('\n').slice(0, MAX_CHARS);
+const qaText = textLines.join('\n').slice(0, MAX_CHARS);
 
 const body = JSON.stringify({
   model: 'Qwen/Qwen2.5-7B-Instruct',
